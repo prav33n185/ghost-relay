@@ -1,26 +1,26 @@
-const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
-const cors = require('cors');
-const bodyParser = require('body-parser');
-
 const app = express();
+const http = require('http'); // HTTP Server
+const server = http.createServer(app); // Wrap Express
+const { Server } = require("socket.io");
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(bodyParser.json({ limit: '10mb' })); // Support large encrypted blobs
+app.use(bodyParser.json({ limit: '10mb' }));
 
-// 1. Database Setup (Memory or File)
+// ... (DB Helper remains same)
 const db = new sqlite3.Database('./relay.db', (err) => {
     if (err) console.error(err.message);
     else console.log('Connected to Relay DB.');
 });
 
 db.serialize(() => {
-    // Table: Messages (Blind Store)
-    // id: UUID
-    // to_peer: Target Peer ID
-    // data: Encrypted Blob (Base64)
-    // timestamp: Created At
     db.run(`CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY,
         to_peer TEXT,
@@ -29,35 +29,64 @@ db.serialize(() => {
     )`);
 });
 
-// 2. Cron Job: Cleanup Old Messages (> 24h)
+// ... (Cron cleanup remains same)
 setInterval(() => {
     const cutoff = Date.now() - (24 * 60 * 60 * 1000);
     db.run(`DELETE FROM messages WHERE timestamp < ?`, [cutoff], (err) => {
         if (err) console.error("Cleanup Error:", err);
-        else console.log("Cleaned up old messages.");
     });
-}, 60 * 60 * 1000); // Every hour
+}, 60 * 60 * 1000);
 
-// 3. API Endpoints
+// SIGNALING LOGIC (Socket.io)
+const onlinePeers = new Map(); // peerId -> socketId
 
+io.on('connection', (socket) => {
+    console.log('User connected:', socket.id);
+
+    // Register User
+    socket.on('join', (peerId) => {
+        onlinePeers.set(peerId, socket.id);
+        socket.peerId = peerId;
+        console.log(`Registered ${peerId}`);
+    });
+
+    // Signaling (Forward Call Data)
+    socket.on('signal', ({ to, data }) => {
+        const targetSocketId = onlinePeers.get(to);
+        if (targetSocketId) {
+            io.to(targetSocketId).emit('signal', { from: socket.peerId, data });
+            console.log(`Signaling from ${socket.peerId} to ${to}`);
+        } else {
+            console.log(`Signal failed: ${to} offline`);
+            // Optional: Store missed call notification?
+        }
+    });
+
+    socket.on('disconnect', () => {
+        if (socket.peerId) {
+            onlinePeers.delete(socket.peerId);
+        }
+    });
+});
+
+// ... (API Endpoints remain same)
 // SEND: Store Encrypted Message
-// Body: { to: "peerId", data: "encrypted_string", id: "uuid" }
 app.post('/send', (req, res) => {
     const { to, data, id } = req.body;
     if (!to || !data || !id) return res.status(400).send("Missing fields");
 
+    // Check if Online (Live Delivery via Socket?) - Optional Optimization
+    // For now, simple Store-and-Forward fallthrough is safer for reliability.
+
     const stmt = db.prepare("INSERT INTO messages (id, to_peer, data, timestamp) VALUES (?, ?, ?, ?)");
     stmt.run(id, to, data, Date.now(), function (err) {
-        if (err) {
-            console.error("Insert Error:", err);
-            return res.status(500).send("Storage Fail");
-        }
+        if (err) return res.status(500).send("Storage Fail");
         res.json({ success: true });
     });
     stmt.finalize();
 });
 
-// INBOX: Get Messages for Peer
+// INBOX: Get Messages
 app.get('/inbox/:peerId', (req, res) => {
     const peerId = req.params.peerId;
     db.all("SELECT * FROM messages WHERE to_peer = ?", [peerId], (err, rows) => {
@@ -75,6 +104,6 @@ app.delete('/inbox/:id', (req, res) => {
     });
 });
 
-app.listen(PORT, () => {
-    console.log(`Ghost Relay Server running on port ${PORT}`);
+server.listen(PORT, () => { // LISTEN ON SERVER (not app)
+    console.log(`Ghost Relay + Signaling running on port ${PORT}`);
 });
