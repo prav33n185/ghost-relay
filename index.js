@@ -63,8 +63,21 @@ io.on('connection', (socket) => {
             console.log(`Signaling from ${socket.peerId} to ${to}`);
         } else {
             console.log(`Signal failed: ${to} offline`);
-            // Optional: Store missed call notification?
         }
+    });
+
+    // Typing Indicator
+    socket.on('typing', ({ to, isTyping }) => {
+        const targetSocketId = onlinePeers.get(to);
+        if (targetSocketId) {
+            io.to(targetSocketId).emit('typing', { from: socket.peerId, isTyping });
+        }
+    });
+
+    // Check Status (Is Peer Online on Relay?)
+    socket.on('check-status', (targetPeerId, callback) => {
+        const isOnline = onlinePeers.has(targetPeerId);
+        if (callback) callback({ isOnline });
     });
 
     socket.on('disconnect', () => {
