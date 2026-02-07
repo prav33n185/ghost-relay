@@ -109,6 +109,90 @@ app.delete('/inbox/:id', (req, res) => {
     });
 });
 
+// --- CLOUD IDENTITY BACKUP (Encrypted Blob Storage) ---
+// Key = Username (Public), Value = AES Encrypted Bundle (Private)
+
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS identities (
+        username TEXT PRIMARY KEY,
+        encrypted_blob TEXT,
+        timestamp INTEGER
+    )`);
+});
+
+// --- CLOUD IDENTITY DIRECTORY (Mobile Number Recovery) ---
+// Key = SHA256(Mobile)
+// Value 1 = Encrypted Bundle (Private Backup)
+// Value 2 = Peer ID (Public Directory)
+
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS identities (
+        username TEXT PRIMARY KEY,
+        encrypted_blob TEXT,
+        peer_id TEXT,  -- ADDED: Public ID for Directory Lookup
+        timestamp INTEGER
+    )`);
+    // Migration for existing tables (won't run if table exists, but that's fine for dev)
+    // In production we'd do ALTER TABLE.
+    try {
+        db.run("ALTER TABLE identities ADD COLUMN peer_id TEXT");
+    } catch (e) { }
+});
+
+// DIRECTORY LOOKUP: Get Public ID from Hash
+app.get('/directory/:hashKey', (req, res) => {
+    const hashKey = req.params.hashKey;
+    db.get("SELECT peer_id FROM identities WHERE username = ?", [hashKey], (err, row) => {
+        if (err) return res.status(500).send("DB Error");
+        if (row && row.peer_id) {
+            res.json({ found: true, peerId: row.peer_id });
+        } else {
+            res.json({ found: false });
+        }
+    });
+});
+
+app.post('/identity/recover', (req, res) => {
+    const { hashKey } = req.body; // SHA256(Mobile)
+    if (!hashKey) return res.status(400).send("Missing hashKey");
+
+    db.get("SELECT encrypted_blob FROM identities WHERE username = ?", [hashKey], (err, row) => {
+        if (err) return res.status(500).send("DB Error");
+        if (row) {
+            res.json({ found: true, blob: row.encrypted_blob });
+        } else {
+            res.json({ found: false });
+        }
+    });
+});
+
+// Register/Update Identity + Directory Entry
+app.post('/identity', (req, res) => {
+    const { username, blob, peerId } = req.body; // Added peerId
+    if (!username || !blob) return res.status(400).send("Missing fields");
+
+    const stmt = db.prepare("INSERT OR REPLACE INTO identities (username, encrypted_blob, peer_id, timestamp) VALUES (?, ?, ?, ?)");
+    stmt.run(username, blob, peerId, Date.now(), function (err) {
+        if (err) return res.status(500).send("Storage Fail: " + err.message);
+        res.json({ success: true });
+    });
+    stmt.finalize();
+});
+
+app.get('/identity/:username', (req, res) => {
+    // Legacy Endpoint support
+    const username = req.params.username;
+    db.get("SELECT encrypted_blob FROM identities WHERE username = ?", [username], (err, row) => {
+        if (err) return res.status(500).send("DB Error");
+        if (row) {
+            res.json({ blob: row.encrypted_blob });
+        } else {
+            res.status(404).send("Not Found");
+        }
+    });
+});
+
+
 server.listen(PORT, () => { // LISTEN ON SERVER (not app)
     console.log(`Ghost Relay + Signaling running on port ${PORT}`);
 });
