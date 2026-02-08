@@ -192,8 +192,6 @@ app.post('/identity', (req, res) => {
     stmt.finalize();
 });
 
-    });
-});
 
 // DEBUG ENDPOINT: List Stored Identities (For Manual Verification)
 app.get('/debug/identities', (req, res) => {
@@ -207,6 +205,14 @@ app.get('/debug/identities', (req, res) => {
                 registeredAt: new Date(r.timestamp).toISOString()
             }))
         });
+    });
+});
+
+// DEBUG: FLUSH DB (As requested for reset)
+app.get('/debug/flush', (req, res) => {
+    db.run("DELETE FROM identities", [], (err) => {
+        if (err) return res.status(500).send("Flush Failed");
+        res.send("Database Flushed. All users removed.");
     });
 });
 
