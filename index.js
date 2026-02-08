@@ -193,6 +193,7 @@ app.post('/identity', (req, res) => {
 });
 
 
+
 // DEBUG ENDPOINT: List Stored Identities (For Manual Verification)
 app.get('/debug/identities', (req, res) => {
     db.all("SELECT username, peer_id, timestamp FROM identities", [], (err, rows) => {
