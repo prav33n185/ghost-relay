@@ -192,6 +192,24 @@ app.post('/identity', (req, res) => {
     stmt.finalize();
 });
 
+    });
+});
+
+// DEBUG ENDPOINT: List Stored Identities (For Manual Verification)
+app.get('/debug/identities', (req, res) => {
+    db.all("SELECT username, peer_id, timestamp FROM identities", [], (err, rows) => {
+        if (err) return res.status(500).send("DB Error");
+        res.json({
+            count: rows.length,
+            users: rows.map(r => ({
+                mobileHash: r.username,
+                peerId: r.peer_id,
+                registeredAt: new Date(r.timestamp).toISOString()
+            }))
+        });
+    });
+});
+
 app.get('/identity/:username', (req, res) => {
     // Legacy Endpoint support
     const username = req.params.username;
