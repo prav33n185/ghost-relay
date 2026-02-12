@@ -47,6 +47,17 @@ db.serialize(() => {
         timestamp INTEGER
     )`);
 
+    // PeerID change history — tracks every PeerId mutation for debugging
+    db.run(`CREATE TABLE IF NOT EXISTS peerid_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username_hash TEXT NOT NULL,
+        display_name TEXT,
+        old_peer_id TEXT,
+        new_peer_id TEXT,
+        source TEXT,
+        timestamp INTEGER NOT NULL
+    )`);
+
     // Migrations for old schema
     db.run("ALTER TABLE identities ADD COLUMN peer_id TEXT", (err) => {
         if (err && !err.message.includes('duplicate column')) {
@@ -174,18 +185,42 @@ app.delete('/inbox/:id', (req, res) => {
 // API: Identity & Directory
 // =============================================
 
-// Register/Update Identity + Directory Entry
+// Register/Update Identity + Directory Entry (with PeerID change logging)
 app.post('/identity', (req, res) => {
     const { username, blob, peerId, displayName } = req.body;
     if (!username || !blob) return res.status(400).json({ error: "Missing fields" });
 
-    const stmt = db.prepare("INSERT OR REPLACE INTO identities (username, encrypted_blob, peer_id, display_name, timestamp) VALUES (?, ?, ?, ?, ?)");
-    stmt.run(username, blob, peerId || null, displayName || null, Date.now(), function (err) {
-        if (err) return res.status(500).json({ error: "Storage failed: " + err.message });
-        console.log(`Identity registered: hash=${username.substring(0, 10)}... peer=${(peerId || 'none').substring(0, 16)}... name=${displayName || 'none'}`);
-        res.json({ success: true });
+    // FIRST: Check if this user already has a registered PeerId
+    db.get("SELECT peer_id, display_name FROM identities WHERE username = ?", [username], (err, existing) => {
+        if (err) return res.status(500).json({ error: "DB Error" });
+
+        const oldPeerId = existing ? existing.peer_id : null;
+        const newPeerId = peerId || null;
+
+        // LOG PeerID change if it changed
+        if (oldPeerId && newPeerId && oldPeerId !== newPeerId) {
+            console.warn(`⚠️ PEERID CHANGED for ${(displayName || username.substring(0, 10))}! Old=${oldPeerId.substring(0, 16)}... New=${newPeerId.substring(0, 16)}...`);
+            db.run(
+                "INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                [username, displayName || null, oldPeerId, newPeerId, 'POST /identity', Date.now()]
+            );
+        } else if (!oldPeerId && newPeerId) {
+            console.log(`✅ First registration: ${(displayName || username.substring(0, 10))} -> ${newPeerId.substring(0, 16)}...`);
+            db.run(
+                "INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                [username, displayName || null, null, newPeerId, 'FIRST_REGISTRATION', Date.now()]
+            );
+        }
+
+        // Now save the identity
+        const stmt = db.prepare("INSERT OR REPLACE INTO identities (username, encrypted_blob, peer_id, display_name, timestamp) VALUES (?, ?, ?, ?, ?)");
+        stmt.run(username, blob, newPeerId, displayName || (existing ? existing.display_name : null), Date.now(), function (err2) {
+            if (err2) return res.status(500).json({ error: "Storage failed: " + err2.message });
+            console.log(`Identity saved: hash=${username.substring(0, 10)}... peer=${(newPeerId || 'none').substring(0, 16)}... name=${displayName || 'none'}`);
+            res.json({ success: true, peerIdChanged: !!(oldPeerId && newPeerId && oldPeerId !== newPeerId) });
+        });
+        stmt.finalize();
     });
-    stmt.finalize();
 });
 
 // Recover Identity by hash
@@ -270,11 +305,30 @@ app.get('/debug/messages', (req, res) => {
     });
 });
 
+// PeerID Change History — shows every time a PeerId was changed for any user
+app.get('/debug/history', (req, res) => {
+    db.all("SELECT * FROM peerid_history ORDER BY timestamp DESC LIMIT 100", [], (err, rows) => {
+        if (err) return res.status(500).json({ error: "DB Error" });
+        res.json({
+            count: rows.length,
+            changes: rows.map(r => ({
+                user: r.display_name || r.username_hash.substring(0, 10) + '...',
+                oldPeerId: r.old_peer_id ? r.old_peer_id.substring(0, 20) + '...' : null,
+                newPeerId: r.new_peer_id ? r.new_peer_id.substring(0, 20) + '...' : null,
+                source: r.source,
+                when: new Date(r.timestamp).toISOString()
+            }))
+        });
+    });
+});
+
 app.get('/debug/flush', (req, res) => {
     db.run("DELETE FROM identities", [], (err) => {
         if (err) return res.status(500).json({ error: "Flush Failed" });
         db.run("DELETE FROM messages", [], () => {
-            res.json({ success: true, message: "Database flushed." });
+            db.run("DELETE FROM peerid_history", [], () => {
+                res.json({ success: true, message: "Database flushed (identities, messages, history)." });
+            });
         });
     });
 });
