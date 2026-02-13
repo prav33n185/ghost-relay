@@ -256,39 +256,43 @@ app.delete('/inbox/:id', (req, res) => {
 // API: Identity & Directory
 // =============================================
 
-// Register/Update Identity + Directory Entry (with PeerID change logging)
+// Register/Update Identity + Directory Entry
+// PeerId is OPTIONAL — hash is the primary identity key
 app.post('/identity', (req, res) => {
     const { username, blob, peerId, displayName } = req.body;
     if (!username || !blob) return res.status(400).json({ error: "Missing fields" });
 
-    // Check existing entry for PeerId change logging
+    // Check existing entry
     db.get("SELECT peer_id, display_name FROM identities WHERE username = ?", [username], (err, existing) => {
         if (err) return res.status(500).json({ error: "DB Error" });
 
         const oldPeerId = existing ? existing.peer_id : null;
         const newPeerId = peerId || null;
 
-        // LOG PeerID change
-        if (oldPeerId && newPeerId && oldPeerId !== newPeerId) {
-            console.warn(`⚠️ PEERID CHANGED for ${(displayName || username.substring(0, 10))}! Old=${oldPeerId.substring(0, 16)}... New=${newPeerId.substring(0, 16)}...`);
-            db.run(
-                "INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                [username, displayName || null, oldPeerId, newPeerId, 'POST /identity', Date.now()]
-            );
-        } else if (!oldPeerId && newPeerId) {
-            console.log(`✅ First registration: ${(displayName || username.substring(0, 10))} -> ${newPeerId.substring(0, 16)}...`);
-            db.run(
-                "INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-                [username, displayName || null, null, newPeerId, 'FIRST_REGISTRATION', Date.now()]
-            );
+        // Only log PeerId change if a peerId was actually sent
+        if (newPeerId) {
+            if (oldPeerId && oldPeerId !== newPeerId) {
+                console.warn(`⚠️ PEERID CHANGED for ${(displayName || username.substring(0, 10))}! Old=${oldPeerId.substring(0, 16)}... New=${newPeerId.substring(0, 16)}...`);
+                db.run(
+                    "INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                    [username, displayName || null, oldPeerId, newPeerId, 'PEERID_CHANGE', Date.now()]
+                );
+            } else if (!oldPeerId) {
+                console.log(`✅ First registration: ${(displayName || username.substring(0, 10))} -> Hash: ${username.substring(0, 10)}...`);
+                db.run(
+                    "INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                    [username, displayName || null, null, newPeerId, 'FIRST_REGISTRATION', Date.now()]
+                );
+            }
         }
 
-        // Save identity
+        // Save identity — keep existing peerId if none sent (don't overwrite with null)
+        const finalPeerId = newPeerId || oldPeerId || null;
         const stmt = db.prepare("INSERT OR REPLACE INTO identities (username, encrypted_blob, peer_id, display_name, timestamp) VALUES (?, ?, ?, ?, ?)");
-        stmt.run(username, blob, newPeerId, displayName || (existing ? existing.display_name : null), Date.now(), function (err2) {
+        stmt.run(username, blob, finalPeerId, displayName || (existing ? existing.display_name : null), Date.now(), function (err2) {
             if (err2) return res.status(500).json({ error: "Storage failed: " + err2.message });
-            console.log(`Identity saved: hash=${username.substring(0, 10)}... peer=${(newPeerId || 'none').substring(0, 16)}... name=${displayName || 'none'}`);
-            res.json({ success: true, peerIdChanged: !!(oldPeerId && newPeerId && oldPeerId !== newPeerId) });
+            console.log(`Identity saved: hash=${username.substring(0, 10)}... name=${displayName || 'none'}`);
+            res.json({ success: true });
         });
         stmt.finalize();
     });
