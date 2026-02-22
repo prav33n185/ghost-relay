@@ -1,5 +1,5 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 
@@ -20,90 +20,81 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
 // =============================================
-// DATABASE SETUP
+// DATABASE SETUP — PostgreSQL (Supabase)
 // =============================================
-const db = new sqlite3.Database('./relay.db', (err) => {
-    if (err) console.error(err.message);
-    else console.log('Connected to Relay DB.');
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }  // Required for Supabase/Render managed PG
 });
 
-db.serialize(() => {
-    // Messages table — DUAL KEYED: by hash (primary) AND legacy peerId
-    db.run(`CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        to_hash TEXT,
-        to_peer TEXT,
-        data TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
-    )`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_to_hash ON messages(to_hash)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_to_peer ON messages(to_peer)`);
+// Auto-create tables on startup
+async function initDB() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                to_hash TEXT,
+                to_peer TEXT,
+                data TEXT NOT NULL,
+                timestamp BIGINT NOT NULL
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_to_hash ON messages(to_hash)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_to_peer ON messages(to_peer)`);
 
-    // Add to_hash column to existing messages table (migration)
-    db.run("ALTER TABLE messages ADD COLUMN to_hash TEXT", (err) => {
-        if (err && !err.message.includes('duplicate column')) {
-            console.error("Migration error:", err.message);
-        }
-    });
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS identities (
+                username TEXT PRIMARY KEY,
+                encrypted_blob TEXT,
+                peer_id TEXT,
+                display_name TEXT,
+                timestamp BIGINT
+            )
+        `);
 
-    // Identities table
-    db.run(`CREATE TABLE IF NOT EXISTS identities (
-        username TEXT PRIMARY KEY,
-        encrypted_blob TEXT,
-        peer_id TEXT,
-        display_name TEXT,
-        timestamp INTEGER
-    )`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS peerid_history (
+                id SERIAL PRIMARY KEY,
+                username_hash TEXT NOT NULL,
+                display_name TEXT,
+                old_peer_id TEXT,
+                new_peer_id TEXT,
+                source TEXT,
+                timestamp BIGINT NOT NULL
+            )
+        `);
 
-    // Migrations for old schema
-    db.run("ALTER TABLE identities ADD COLUMN peer_id TEXT", (err) => {
-        if (err && !err.message.includes('duplicate column')) {
-            console.error("Migration error:", err.message);
-        }
-    });
-    db.run("ALTER TABLE identities ADD COLUMN display_name TEXT", (err) => {
-        if (err && !err.message.includes('duplicate column')) {
-            console.error("Migration error:", err.message);
-        }
-    });
-
-    // PeerID change history — tracks every PeerId mutation for debugging
-    db.run(`CREATE TABLE IF NOT EXISTS peerid_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username_hash TEXT NOT NULL,
-        display_name TEXT,
-        old_peer_id TEXT,
-        new_peer_id TEXT,
-        source TEXT,
-        timestamp INTEGER NOT NULL
-    )`);
-});
+        console.log('✅ PostgreSQL tables initialized');
+    } catch (err) {
+        console.error('❌ DB Init Error:', err.message);
+        process.exit(1);
+    }
+}
 
 // Cleanup old messages (>24h)
-setInterval(() => {
-    const cutoff = Date.now() - (24 * 60 * 60 * 1000);
-    db.run(`DELETE FROM messages WHERE timestamp < ?`, [cutoff], function (err) {
-        if (err) console.error("Cleanup Error:", err);
-        else if (this.changes > 0) console.log(`Cleaned up ${this.changes} old messages`);
-    });
+setInterval(async () => {
+    try {
+        const cutoff = Date.now() - (24 * 60 * 60 * 1000);
+        const result = await pool.query('DELETE FROM messages WHERE timestamp < $1', [cutoff]);
+        if (result.rowCount > 0) console.log(`Cleaned up ${result.rowCount} old messages`);
+    } catch (err) {
+        console.error("Cleanup Error:", err.message);
+    }
 }, 60 * 60 * 1000);
 
 // =============================================
 // SOCKET.IO: Signaling & Presence
 // =============================================
-// DUAL MAP: Both peerId and hash map to the same socket
-const onlinePeers = new Map();  // peerId -> socketId
-const onlineHashes = new Map(); // mobileHash -> socketId
+const onlinePeers = new Map();
+const onlineHashes = new Map();
 
 io.on('connection', (socket) => {
     console.log('Socket connected:', socket.id);
 
-    // NEW: Join accepts { peerId, mobileHash } object OR legacy string
-    socket.on('join', (payload) => {
+    socket.on('join', async (payload) => {
         let peerId, mobileHash;
 
         if (typeof payload === 'string') {
-            // Legacy: just peerId string
             peerId = payload;
         } else if (payload && typeof payload === 'object') {
             peerId = payload.peerId;
@@ -121,25 +112,37 @@ io.on('connection', (socket) => {
             socket.mobileHash = mobileHash;
             console.log(`Registered hash: ${mobileHash.substring(0, 10)}...`);
 
-            // INSTANT DELIVERY: Push any queued messages for this HASH
-            db.all("SELECT * FROM messages WHERE to_hash = ?", [mobileHash], (err, rows) => {
-                if (err || !rows || rows.length === 0) return;
-                console.log(`Delivering ${rows.length} queued msgs to hash ${mobileHash.substring(0, 10)}...`);
-                for (const item of rows) {
-                    socket.emit('relay-message', { id: item.id, data: item.data });
+            // INSTANT DELIVERY: Push queued messages for this HASH
+            try {
+                const { rows } = await pool.query(
+                    'SELECT * FROM messages WHERE to_hash = $1', [mobileHash]
+                );
+                if (rows.length > 0) {
+                    console.log(`Delivering ${rows.length} queued msgs to hash ${mobileHash.substring(0, 10)}...`);
+                    for (const item of rows) {
+                        socket.emit('relay-message', { id: item.id, data: item.data });
+                    }
                 }
-            });
+            } catch (err) {
+                console.error("Queue delivery error:", err.message);
+            }
         }
 
         // Also deliver legacy peerId-addressed messages
         if (peerId) {
-            db.all("SELECT * FROM messages WHERE to_peer = ? AND to_hash IS NULL", [peerId], (err, rows) => {
-                if (err || !rows || rows.length === 0) return;
-                console.log(`Delivering ${rows.length} legacy msgs to peerId...`);
-                for (const item of rows) {
-                    socket.emit('relay-message', { id: item.id, data: item.data });
+            try {
+                const { rows } = await pool.query(
+                    'SELECT * FROM messages WHERE to_peer = $1 AND to_hash IS NULL', [peerId]
+                );
+                if (rows.length > 0) {
+                    console.log(`Delivering ${rows.length} legacy msgs to peerId...`);
+                    for (const item of rows) {
+                        socket.emit('relay-message', { id: item.id, data: item.data });
+                    }
                 }
-            });
+            } catch (err) {
+                console.error("Legacy delivery error:", err.message);
+            }
         }
     });
 
@@ -171,22 +174,34 @@ io.on('connection', (socket) => {
 // =============================================
 // API: Health Check
 // =============================================
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        uptime: process.uptime(),
-        onlinePeers: onlinePeers.size,
-        onlineHashes: onlineHashes.size,
-        timestamp: Date.now()
-    });
+app.get('/health', async (req, res) => {
+    try {
+        // Quick DB health check
+        await pool.query('SELECT 1');
+        res.json({
+            status: 'ok',
+            db: 'postgresql',
+            uptime: process.uptime(),
+            onlinePeers: onlinePeers.size,
+            onlineHashes: onlineHashes.size,
+            timestamp: Date.now()
+        });
+    } catch (err) {
+        res.json({
+            status: 'degraded',
+            db: 'postgresql-error',
+            error: err.message,
+            uptime: process.uptime(),
+            timestamp: Date.now()
+        });
+    }
 });
 
 // =============================================
 // API: Store-and-Forward Messaging
 // =============================================
 
-// NEW: Send by HASH (primary) — also accepts legacy peerId via 'to'
-app.post('/send', (req, res) => {
+app.post('/send', async (req, res) => {
     const { toHash, to, data, id } = req.body;
     if (!data || !id) return res.status(400).json({ error: "Missing data or id" });
     if (!toHash && !to) return res.status(400).json({ error: "Missing toHash or to" });
@@ -194,14 +209,15 @@ app.post('/send', (req, res) => {
     const targetHash = toHash || null;
     const targetPeer = to || null;
 
-    const stmt = db.prepare("INSERT OR IGNORE INTO messages (id, to_hash, to_peer, data, timestamp) VALUES (?, ?, ?, ?, ?)");
-    stmt.run(id, targetHash, targetPeer, data, Date.now(), function (err) {
-        if (err) return res.status(500).json({ error: "Storage failed" });
+    try {
+        await pool.query(
+            'INSERT INTO messages (id, to_hash, to_peer, data, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING',
+            [id, targetHash, targetPeer, data, Date.now()]
+        );
 
         // Attempt LIVE delivery via Socket
         let delivered = false;
 
-        // Try hash-based delivery first (preferred)
         if (targetHash) {
             const socketId = onlineHashes.get(targetHash);
             if (socketId) {
@@ -210,7 +226,6 @@ app.post('/send', (req, res) => {
             }
         }
 
-        // Fallback: try peerId-based delivery
         if (!delivered && targetPeer) {
             const socketId = onlinePeers.get(targetPeer);
             if (socketId) {
@@ -221,142 +236,176 @@ app.post('/send', (req, res) => {
 
         console.log(`Message ${id.substring(0, 8)}... -> hash=${(targetHash || 'none').substring(0, 10)} peer=${(targetPeer || 'none').substring(0, 16)} live=${delivered}`);
         res.json({ success: true, liveDelivered: delivered });
-    });
-    stmt.finalize();
+    } catch (err) {
+        console.error("Send Error:", err.message);
+        res.status(500).json({ error: "Storage failed" });
+    }
 });
 
-// NEW: Inbox by HASH (primary endpoint)
-app.get('/inbox/hash/:hash', (req, res) => {
-    const hash = req.params.hash;
-    db.all("SELECT * FROM messages WHERE to_hash = ? ORDER BY timestamp ASC", [hash], (err, rows) => {
-        if (err) return res.status(500).json({ error: "DB Error" });
-        res.json(rows || []);
-    });
+// Inbox by HASH (primary)
+app.get('/inbox/hash/:hash', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT * FROM messages WHERE to_hash = $1 ORDER BY timestamp ASC', [req.params.hash]
+        );
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
 // Legacy: Inbox by peerId
-app.get('/inbox/:peerId', (req, res) => {
-    const peerId = req.params.peerId;
-    db.all("SELECT * FROM messages WHERE to_peer = ? ORDER BY timestamp ASC", [peerId], (err, rows) => {
-        if (err) return res.status(500).json({ error: "DB Error" });
-        res.json(rows || []);
-    });
+app.get('/inbox/:peerId', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT * FROM messages WHERE to_peer = $1 ORDER BY timestamp ASC', [req.params.peerId]
+        );
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
-// Delete message by ID (works for both hash and peerId addressed messages)
-app.delete('/inbox/:id', (req, res) => {
-    const id = req.params.id;
-    db.run("DELETE FROM messages WHERE id = ?", [id], function (err) {
-        if (err) return res.status(500).json({ error: "DB Error" });
+// Delete message by ID
+app.delete('/inbox/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM messages WHERE id = $1', [req.params.id]);
         res.json({ success: true });
-    });
+    } catch (err) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
 // =============================================
 // API: Identity & Directory
 // =============================================
 
-// Register/Update Identity + Directory Entry
-// PeerId is OPTIONAL — hash is the primary identity key
-app.post('/identity', (req, res) => {
+app.post('/identity', async (req, res) => {
     const { username, blob, peerId, displayName } = req.body;
     if (!username || !blob) return res.status(400).json({ error: "Missing fields" });
 
-    // Check existing entry
-    db.get("SELECT peer_id, display_name FROM identities WHERE username = ?", [username], (err, existing) => {
-        if (err) return res.status(500).json({ error: "DB Error" });
+    try {
+        // Check existing entry
+        const { rows } = await pool.query(
+            'SELECT peer_id, display_name FROM identities WHERE username = $1', [username]
+        );
+        const existing = rows[0] || null;
 
         const oldPeerId = existing ? existing.peer_id : null;
         const newPeerId = peerId || null;
 
-        // Only log PeerId change if a peerId was actually sent
+        // Log PeerId changes
         if (newPeerId) {
             if (oldPeerId && oldPeerId !== newPeerId) {
                 console.warn(`⚠️ PEERID CHANGED for ${(displayName || username.substring(0, 10))}! Old=${oldPeerId.substring(0, 16)}... New=${newPeerId.substring(0, 16)}...`);
-                db.run(
-                    "INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                await pool.query(
+                    'INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
                     [username, displayName || null, oldPeerId, newPeerId, 'PEERID_CHANGE', Date.now()]
                 );
             } else if (!oldPeerId) {
                 console.log(`✅ First registration: ${(displayName || username.substring(0, 10))} -> Hash: ${username.substring(0, 10)}...`);
-                db.run(
-                    "INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                await pool.query(
+                    'INSERT INTO peerid_history (username_hash, display_name, old_peer_id, new_peer_id, source, timestamp) VALUES ($1, $2, $3, $4, $5, $6)',
                     [username, displayName || null, null, newPeerId, 'FIRST_REGISTRATION', Date.now()]
                 );
             }
         }
 
-        // Save identity — keep existing peerId if none sent (don't overwrite with null)
+        // Save identity — keep existing peerId if none sent
         const finalPeerId = newPeerId || oldPeerId || null;
-        const stmt = db.prepare("INSERT OR REPLACE INTO identities (username, encrypted_blob, peer_id, display_name, timestamp) VALUES (?, ?, ?, ?, ?)");
-        stmt.run(username, blob, finalPeerId, displayName || (existing ? existing.display_name : null), Date.now(), function (err2) {
-            if (err2) return res.status(500).json({ error: "Storage failed: " + err2.message });
-            console.log(`Identity saved: hash=${username.substring(0, 10)}... name=${displayName || 'none'}`);
-            res.json({ success: true });
-        });
-        stmt.finalize();
-    });
+        const finalDisplayName = displayName || (existing ? existing.display_name : null);
+
+        await pool.query(
+            `INSERT INTO identities (username, encrypted_blob, peer_id, display_name, timestamp) 
+             VALUES ($1, $2, $3, $4, $5) 
+             ON CONFLICT (username) DO UPDATE SET 
+                encrypted_blob = EXCLUDED.encrypted_blob,
+                peer_id = EXCLUDED.peer_id,
+                display_name = EXCLUDED.display_name,
+                timestamp = EXCLUDED.timestamp`,
+            [username, blob, finalPeerId, finalDisplayName, Date.now()]
+        );
+
+        console.log(`Identity saved: hash=${username.substring(0, 10)}... name=${displayName || 'none'}`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error("Identity Save Error:", err.message);
+        res.status(500).json({ error: "Storage failed: " + err.message });
+    }
 });
 
 // Recover Identity by hash
-app.post('/identity/recover', (req, res) => {
+app.post('/identity/recover', async (req, res) => {
     const { hashKey } = req.body;
     if (!hashKey) return res.status(400).json({ error: "Missing hashKey" });
 
-    db.get("SELECT encrypted_blob, peer_id, display_name FROM identities WHERE username = ?", [hashKey], (err, row) => {
-        if (err) return res.status(500).json({ error: "DB Error" });
-        if (row) {
-            res.json({ found: true, blob: row.encrypted_blob, peerId: row.peer_id, displayName: row.display_name });
+    try {
+        const { rows } = await pool.query(
+            'SELECT encrypted_blob, peer_id, display_name FROM identities WHERE username = $1', [hashKey]
+        );
+        if (rows[0]) {
+            res.json({ found: true, blob: rows[0].encrypted_blob, peerId: rows[0].peer_id, displayName: rows[0].display_name });
         } else {
             res.json({ found: false });
         }
-    });
+    } catch (err) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
-// Directory Lookup: Get PeerId + DisplayName from hash
-app.get('/directory/:hashKey', (req, res) => {
-    const hashKey = req.params.hashKey;
-    db.get("SELECT peer_id, display_name FROM identities WHERE username = ?", [hashKey], (err, row) => {
-        if (err) return res.status(500).json({ error: "DB Error" });
-        if (row) {
-            // Return found=true even if peer_id is null — user IS registered
-            res.json({ found: true, peerId: row.peer_id, displayName: row.display_name });
+// Directory Lookup
+app.get('/directory/:hashKey', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT peer_id, display_name FROM identities WHERE username = $1', [req.params.hashKey]
+        );
+        if (rows[0]) {
+            res.json({ found: true, peerId: rows[0].peer_id, displayName: rows[0].display_name });
         } else {
             res.json({ found: false });
         }
-    });
+    } catch (err) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
 // Legacy endpoint
-app.get('/identity/:username', (req, res) => {
-    const username = req.params.username;
-    db.get("SELECT encrypted_blob, peer_id, display_name FROM identities WHERE username = ?", [username], (err, row) => {
-        if (err) return res.status(500).json({ error: "DB Error" });
-        if (row) {
-            res.json({ blob: row.encrypted_blob, peerId: row.peer_id, displayName: row.display_name });
+app.get('/identity/:username', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT encrypted_blob, peer_id, display_name FROM identities WHERE username = $1', [req.params.username]
+        );
+        if (rows[0]) {
+            res.json({ blob: rows[0].encrypted_blob, peerId: rows[0].peer_id, displayName: rows[0].display_name });
         } else {
             res.status(404).json({ error: "Not Found" });
         }
-    });
+    } catch (err) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
 // =============================================
 // DEBUG ENDPOINTS
 // =============================================
 
-app.get('/debug/identities', (req, res) => {
-    db.all("SELECT username, peer_id, display_name, timestamp FROM identities", [], (err, rows) => {
-        if (err) return res.status(500).json({ error: "DB Error" });
+app.get('/debug/identities', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT username, peer_id, display_name, timestamp FROM identities'
+        );
         res.json({
             count: rows.length,
             users: rows.map(r => ({
                 mobileHash: r.username,
                 peerId: r.peer_id,
                 displayName: r.display_name,
-                registeredAt: r.timestamp ? new Date(r.timestamp).toISOString() : null
+                registeredAt: r.timestamp ? new Date(Number(r.timestamp)).toISOString() : null
             }))
         });
-    });
+    } catch (err) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
 app.get('/debug/online', (req, res) => {
@@ -370,24 +419,30 @@ app.get('/debug/online', (req, res) => {
     res.json({ count: peers.length, peers });
 });
 
-app.get('/debug/messages', (req, res) => {
-    db.all("SELECT id, to_hash, to_peer, timestamp FROM messages ORDER BY timestamp DESC LIMIT 50", [], (err, rows) => {
-        if (err) return res.status(500).json({ error: "DB Error" });
+app.get('/debug/messages', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT id, to_hash, to_peer, timestamp FROM messages ORDER BY timestamp DESC LIMIT 50'
+        );
         res.json({
             count: rows.length,
             messages: rows.map(r => ({
                 id: r.id,
                 toHash: r.to_hash ? r.to_hash.substring(0, 16) + '...' : null,
                 toPeer: r.to_peer ? r.to_peer.substring(0, 20) + '...' : null,
-                age: Math.round((Date.now() - r.timestamp) / 1000) + 's ago'
+                age: Math.round((Date.now() - Number(r.timestamp)) / 1000) + 's ago'
             }))
         });
-    });
+    } catch (err) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
-app.get('/debug/history', (req, res) => {
-    db.all("SELECT * FROM peerid_history ORDER BY timestamp DESC LIMIT 100", [], (err, rows) => {
-        if (err) return res.status(500).json({ error: "DB Error" });
+app.get('/debug/history', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT * FROM peerid_history ORDER BY timestamp DESC LIMIT 100'
+        );
         res.json({
             count: rows.length,
             changes: rows.map(r => ({
@@ -395,26 +450,33 @@ app.get('/debug/history', (req, res) => {
                 oldPeerId: r.old_peer_id ? r.old_peer_id.substring(0, 20) + '...' : null,
                 newPeerId: r.new_peer_id ? r.new_peer_id.substring(0, 20) + '...' : null,
                 source: r.source,
-                when: new Date(r.timestamp).toISOString()
+                when: new Date(Number(r.timestamp)).toISOString()
             }))
         });
-    });
+    } catch (err) {
+        res.status(500).json({ error: "DB Error" });
+    }
 });
 
-app.get('/debug/flush', (req, res) => {
-    db.run("DELETE FROM identities", [], (err) => {
-        if (err) return res.status(500).json({ error: "Flush Failed" });
-        db.run("DELETE FROM messages", [], () => {
-            db.run("DELETE FROM peerid_history", [], () => {
-                res.json({ success: true, message: "Database flushed (identities, messages, history)." });
-            });
-        });
-    });
+app.get('/debug/flush', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM identities');
+        await pool.query('DELETE FROM messages');
+        await pool.query('DELETE FROM peerid_history');
+        res.json({ success: true, message: "Database flushed (identities, messages, history)." });
+    } catch (err) {
+        res.status(500).json({ error: "Flush Failed" });
+    }
 });
 
 // =============================================
 // START SERVER
 // =============================================
-server.listen(PORT, () => {
-    console.log(`Ghost Relay running on port ${PORT}`);
+initDB().then(() => {
+    server.listen(PORT, () => {
+        console.log(`Ghost Relay running on port ${PORT} (PostgreSQL)`);
+    });
+}).catch(err => {
+    console.error("Failed to initialize database:", err);
+    process.exit(1);
 });
